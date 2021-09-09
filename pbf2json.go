@@ -279,7 +279,7 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 					}
 
 					// compute centroid
-					centroid, bounds := computeCentroidAndBounds(latlons)
+					centroid, bounds := ComputeCentroidAndBounds(latlons)
 
 					// trim tags
 					v.Tags = trimTags(v.Tags)
@@ -318,53 +318,13 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 						continue
 					}
 
-					// best centroid and bounds to use
-					var largestArea = 0.0
-					var centroid map[string]string
-					var bounds *geo.Bound
+					// consult https://wiki.openstreetmap.org/wiki/DE:Relation:multipolygon on how osm handles outer members
+					centroid, bounds := ComputeRelationCentroidAndBounds(memberWayLatLons)
 
-					// iterate over each way, selecting the largest way to use
-					// for the centroid and bbox
-					for _, latlons := range memberWayLatLons {
-
-						// compute centroid
-						wayCentroid, wayBounds := computeCentroidAndBounds(latlons)
-
-						// if for any reason we failed to find a valid bounds
-						if nil == wayBounds {
-							log.Println("[warn] failed to calculate bounds for relation member way")
-							continue
-						}
-
-						area := math.Max(wayBounds.GeoWidth(), 0.000001) * math.Max(wayBounds.GeoHeight(), 0.000001)
-
-						// find the way with the largest area
-						if area > largestArea {
-							largestArea = area
-							centroid = wayCentroid
-							bounds = wayBounds
-						}
-					}
-
-					// if for any reason we failed to find a valid bounds
-					if nil == bounds {
-						log.Println("[warn] denormalize failed for relation:", v.ID, "no valid bounds")
+					if centroid == nil || bounds == nil {
+						// the relation is probably not a whole part of the osm dump
+						log.Printf("[warn] could not find centroid and bounds of %d", v.ID)
 						continue
-					}
-
-					// use 'admin_centre' node centroid where available
-					// note: only applies to 'boundary=administrative' relations
-					// see: https://github.com/pelias/pbf2json/pull/98
-					if v.Tags["boundary"] == "administrative" {
-						for _, member := range v.Members {
-							if member.Type == 0 && member.Role == "admin_centre" {
-								if latlons, err := cacheLookupNodeByID(db, member.ID); err == nil {
-									latlons["type"] = "admin_centre"
-									centroid = latlons
-									break
-								}
-							}
-						}
 					}
 
 					// trim tags
@@ -384,22 +344,19 @@ func print(d *osmpbf.Decoder, masks *BitmaskMap, db *leveldb.DB, config settings
 }
 
 // lookup all latlons for all ways in relation
-func findMemberWayLatLons(db *leveldb.DB, v *osmpbf.Relation) [][]map[string]string {
-	var memberWayLatLons [][]map[string]string
+func findMemberWayLatLons(db *leveldb.DB, v *osmpbf.Relation) map[osmpbf.Member][]map[string]string {
+	var memberWayLatLons = make(map[osmpbf.Member][]map[string]string)
 
 	for _, mem := range v.Members {
-		if mem.Type == 1 {
+		// lookup from leveldb
+		latlons, err := cacheLookupWayNodes(db, mem.ID)
 
-			// lookup from leveldb
-			latlons, err := cacheLookupWayNodes(db, mem.ID)
-
-			// skip way if it fails to denormalize
-			if err != nil {
-				break
-			}
-
-			memberWayLatLons = append(memberWayLatLons, latlons)
+		// skip way if it fails to denormalize
+		if err != nil {
+			break
 		}
+
+		memberWayLatLons[mem] = latlons
 	}
 
 	return memberWayLatLons
@@ -685,10 +642,7 @@ func selectEntrance(entrances []map[string]string) map[string]string {
 	return centroid
 }
 
-// compute the centroid of a way and its bbox
-func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *geo.Bound) {
-
-	// check to see if there is a tagged entrance we can use.
+func getEntrance(latlons []map[string]string) (bool, map[string]string, *geo.Bound) {
 	var entrances []map[string]string
 	for _, latlon := range latlons {
 		if _, ok := latlon["entrance"]; ok {
@@ -706,15 +660,26 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 
 	// use the mapped entrance location where available
 	if len(entrances) > 0 {
-		return selectEntrance(entrances), points.Bound()
+		return true, selectEntrance(entrances), points.Bound()
 	}
+
+	return false, nil, nil
+}
+
+// ComputeCentroidAndBounds compute the centroid of a way and its bbox for polygons and lines
+func ComputeCentroidAndBounds(latlons []map[string]string) (map[string]string, *geo.Bound) {
+	hasEntrance, entranceLatLon, entranceBounds := getEntrance(latlons)
+
+	if hasEntrance {
+		return entranceLatLon, entranceBounds
+	}
+
+	// convert lat/lon map to geo.PointSet
+	points := LatLngMapToPointSet(latlons)
 
 	// determine if the way is a closed centroid or a linestring
 	// by comparing first and last coordinates.
-	isClosed := false
-	if points.Length() > 2 {
-		isClosed = points.First().Equals(points.Last())
-	}
+	isClosed := IsPointSetClosed(points)
 
 	// compute the centroid using one of two different algorithms
 	var compute *geo.Point
@@ -725,9 +690,7 @@ func computeCentroidAndBounds(latlons []map[string]string) (map[string]string, *
 	}
 
 	// return point as lat/lon map
-	var centroid = make(map[string]string)
-	centroid["lat"] = strconv.FormatFloat(compute.Lat(), 'f', 7, 64)
-	centroid["lon"] = strconv.FormatFloat(compute.Lng(), 'f', 7, 64)
+	centroid := PointToLatLon(compute)
 
 	return centroid, points.Bound()
 }
